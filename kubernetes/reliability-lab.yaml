@@ -1,0 +1,219 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: reliability-lab
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: reliability-lab-data
+  namespace: reliability-lab
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: reliability-lab-canary-policy
+  namespace: reliability-lab
+spec:
+  metrics:
+    - name: candidate-sample-count
+      interval: 1m
+      count: 3
+      failureLimit: 0
+      successCondition: result[0] >= 20
+      provider:
+        prometheus:
+          address: http://reliability-prometheus:9090
+          query: |
+            sum(increase(reliability_business_requests_total{track="candidate"}[5m])) or vector(0)
+    - name: candidate-error-rate
+      interval: 1m
+      count: 3
+      failureLimit: 0
+      successCondition: result[0] <= 0.01
+      provider:
+        prometheus:
+          address: http://reliability-prometheus:9090
+          query: |
+            (
+              sum(increase(reliability_business_requests_total{track="candidate",status=~"5xx|other"}[5m]))
+              or vector(0)
+            )
+            /
+            clamp_min(
+              sum(increase(reliability_business_requests_total{track="candidate"}[5m])) or vector(0),
+              1
+            )
+    - name: candidate-p95-latency
+      interval: 1m
+      count: 3
+      failureLimit: 0
+      successCondition: result[0] <= 0.25
+      provider:
+        prometheus:
+          address: http://reliability-prometheus:9090
+          query: |
+            histogram_quantile(
+              0.95,
+              sum by (le) (rate(reliability_business_request_duration_seconds_bucket{track="candidate"}[5m]))
+            ) or vector(0)
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: reliability-lab
+  namespace: reliability-lab
+spec:
+  replicas: 4
+  revisionHistoryLimit: 2
+  progressDeadlineSeconds: 1800
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: reliability-lab
+  strategy:
+    canary:
+      stableService: reliability-lab-stable
+      canaryService: reliability-lab-canary
+      maxSurge: 1
+      maxUnavailable: 0
+      stableMetadata:
+        labels:
+          track: stable
+      canaryMetadata:
+        labels:
+          track: candidate
+      steps:
+        - setWeight: 25
+        - pause:
+            duration: 5m
+        - analysis:
+            templates:
+              - templateName: reliability-lab-canary-policy
+        - setWeight: 50
+        - pause:
+            duration: 5m
+        - analysis:
+            templates:
+              - templateName: reliability-lab-canary-policy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: reliability-lab
+      annotations:
+        prometheus.io/scrape: "true"
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: reliability-lab
+          image: reliability-lab:local
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            - name: RELIABILITY_HOST
+              value: 0.0.0.0
+            - name: RELIABILITY_PORT
+              value: "8000"
+            - name: RELIABILITY_DB_PATH
+              value: /data/reliability.db
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: RELIABILITY_OPERATOR_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: reliability-operator
+                  key: token
+                  optional: true
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 2
+            failureThreshold: 15
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: application-data
+              mountPath: /data
+      volumes:
+        - name: application-data
+          persistentVolumeClaim:
+            claimName: reliability-lab-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: reliability-lab
+  namespace: reliability-lab
+spec:
+  selector:
+    app.kubernetes.io/name: reliability-lab
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: reliability-lab-stable
+  namespace: reliability-lab
+spec:
+  selector:
+    app.kubernetes.io/name: reliability-lab
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: reliability-lab-canary
+  namespace: reliability-lab
+spec:
+  selector:
+    app.kubernetes.io/name: reliability-lab
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http

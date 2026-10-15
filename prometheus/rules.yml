@@ -1,0 +1,102 @@
+groups:
+  - name: reliability-lab-slo
+    interval: 30s
+    rules:
+      - record: reliability:business_requests:rate5m
+        expr: sum(rate(reliability_business_requests_total[5m]))
+      - record: reliability:business_errors:rate5m
+        expr: sum(rate(reliability_business_requests_total{status=~"5xx|other"}[5m])) or vector(0)
+      - record: reliability:business_slow_requests:rate5m
+        expr: |
+          sum(rate(reliability_business_request_duration_seconds_count[5m]))
+          - sum(rate(reliability_business_request_duration_seconds_bucket{le="0.25"}[5m]))
+      - alert: ReliabilityLabNoBusinessTraffic
+        expr: |
+          (sum(rate(reliability_business_requests_total[5m])) == 0)
+          or absent(reliability_business_requests_total)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: No business API observations are reaching the reliability lab
+          description: The business SLI is unknown without observations; this alert does not report it as healthy.
+      - alert: ReliabilityLabAvailabilityBurnFast
+        expr: |
+          (
+            sum(rate(reliability_business_requests_total{status=~"5xx|other"}[5m]))
+            / clamp_min(sum(rate(reliability_business_requests_total[5m])), 1e-9) > 0.144
+          )
+          and
+          (
+            sum(rate(reliability_business_requests_total{status=~"5xx|other"}[1h]))
+            / clamp_min(sum(rate(reliability_business_requests_total[1h])), 1e-9) > 0.144
+          )
+          and (sum(rate(reliability_business_requests_total[5m])) > 0)
+          and (sum(rate(reliability_business_requests_total[1h])) > 0)
+        for: 2m
+        labels:
+          severity: critical
+          slo: availability
+        annotations:
+          summary: Availability error budget is burning at least 14.4x
+          description: 5m and 1h business request windows both exceed 14.4x burn for the 99% availability objective.
+      - alert: ReliabilityLabAvailabilityBurnSlow
+        expr: |
+          (
+            sum(rate(reliability_business_requests_total{status=~"5xx|other"}[30m]))
+            / clamp_min(sum(rate(reliability_business_requests_total[30m])), 1e-9) > 0.06
+          )
+          and
+          (
+            sum(rate(reliability_business_requests_total{status=~"5xx|other"}[6h]))
+            / clamp_min(sum(rate(reliability_business_requests_total[6h])), 1e-9) > 0.06
+          )
+          and (sum(rate(reliability_business_requests_total[30m])) > 0)
+          and (sum(rate(reliability_business_requests_total[6h])) > 0)
+        for: 15m
+        labels:
+          severity: warning
+          slo: availability
+        annotations:
+          summary: Availability error budget is burning at least 6x
+          description: 30m and 6h business request windows both exceed 6x burn for the 99% availability objective.
+      - alert: ReliabilityLabLatencyBurnFast
+        expr: |
+          (
+            1 - sum(rate(reliability_business_request_duration_seconds_bucket{le="0.25"}[5m]))
+            / clamp_min(sum(rate(reliability_business_request_duration_seconds_count[5m])), 1e-9) > 0.72
+          )
+          and
+          (
+            1 - sum(rate(reliability_business_request_duration_seconds_bucket{le="0.25"}[1h]))
+            / clamp_min(sum(rate(reliability_business_request_duration_seconds_count[1h])), 1e-9) > 0.72
+          )
+          and (sum(rate(reliability_business_request_duration_seconds_count[5m])) > 0)
+          and (sum(rate(reliability_business_request_duration_seconds_count[1h])) > 0)
+        for: 2m
+        labels:
+          severity: critical
+          slo: latency
+        annotations:
+          summary: Latency objective error budget is burning at least 14.4x
+          description: More than 72% of business responses exceed 250ms in both 5m and 1h windows.
+      - alert: ReliabilityLabLatencyBurnSlow
+        expr: |
+          (
+            1 - sum(rate(reliability_business_request_duration_seconds_bucket{le="0.25"}[30m]))
+            / clamp_min(sum(rate(reliability_business_request_duration_seconds_count[30m])), 1e-9) > 0.3
+          )
+          and
+          (
+            1 - sum(rate(reliability_business_request_duration_seconds_bucket{le="0.25"}[6h]))
+            / clamp_min(sum(rate(reliability_business_request_duration_seconds_count[6h])), 1e-9) > 0.3
+          )
+          and (sum(rate(reliability_business_request_duration_seconds_count[30m])) > 0)
+          and (sum(rate(reliability_business_request_duration_seconds_count[6h])) > 0)
+        for: 15m
+        labels:
+          severity: warning
+          slo: latency
+        annotations:
+          summary: Latency objective error budget is burning at least 6x
+          description: More than 30% of business responses exceed 250ms in both 30m and 6h windows.
