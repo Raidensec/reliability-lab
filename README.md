@@ -1,35 +1,24 @@
 # Reliability Lab
 
-Reliability Lab is a local Python 3.12 service for practicing service-level
-measurement, canary decisions, controlled fault injection, and SQLite recovery.
-It stores customer orders in SQLite and reports measurements observed by the
-commands in this repository. The example objectives are policy inputs; running
-the project does not establish a production SLO or a 99.9% availability claim.
+A small Python service for practicing the reliability work around an API: start
+it, collect request observations, compare two cohorts, inject a short outage, and
+verify a SQLite backup. The service uses the Python standard library and SQLite.
 
-## Start locally
+## Start the API
 
-From the repository root with Python 3.12 installed:
+From PowerShell in the repository root, install with Python 3.12 and start the
+service:
 
 ```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
 python -m pip install -e .
 reliability-lab serve --database data\reliability.db
 ```
 
-The service listens on `127.0.0.1:8000` by default. `RELIABILITY_HOST`,
-`RELIABILITY_PORT`, and `RELIABILITY_DB_PATH` configure the listener and default
-database path. The server creates the database directory and applies schema
-migration version 1 at startup. To set a different port, pass `--port` to
-`serve`; `--host` sets the bind address.
-
-This is a reliability lab, not an authenticated order service. Business routes
-have no user authentication or TLS. Keep the listener on loopback or behind a
-trusted private network; do not expose it to the public internet. See
-[security notes](docs/security.md).
-
-Create and read an order from another PowerShell window:
+The service listens on `127.0.0.1:8000`. It creates the database directory and
+applies its schema when it starts. In another PowerShell window, create and
+read an order:
 
 ```powershell
 $order = @{ customer = "München Bakery"; amount_cents = 4250 } | ConvertTo-Json
@@ -38,39 +27,53 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/orders `
 Invoke-RestMethod -Method Get -Uri http://127.0.0.1:8000/api/orders
 ```
 
-`POST /api/orders` accepts exactly `customer` and positive `amount_cents` fields.
-Customer names are trimmed and limited to 120 characters; amounts are limited
-to 1 through 1,000,000,000 cents. `GET /api/orders` returns the most recent 50
-orders. Invalid JSON or fields return HTTP 400; request bodies above 16 KiB
-return HTTP 413; SQLite errors return HTTP 503. Health checks are `GET /healthz`
-for process liveness and `GET /readyz` for database and migration readiness.
+`POST /api/orders` accepts exactly `customer` and positive integer
+`amount_cents`. The customer must be nonblank and at most 120 characters; the
+stored name is trimmed. Amounts range from 1 to 1,000,000,000 cents. Invalid
+requests return HTTP 400, bodies over 16 KiB return 413, and SQLite errors
+return 503. `GET /api/orders` returns the latest 50 orders. `GET /healthz` is a
+liveness check; `GET /readyz` checks the database and schema. The order API has
+no user authentication or TLS, so keep it on loopback or a trusted private
+network. See [security notes](docs/security.md).
 
-## Observe and compare
+## Observe requests
 
-Only `/api/orders` contributes to business request metrics. Health, readiness,
-metrics, operator, and unknown paths are excluded. The metric labels are bounded
-to the fixed route `/api/orders`, method `GET`/`POST`/`OTHER`, and status class
-`2xx`/`3xx`/`4xx`/`5xx`/`other`. The Prometheus exposition is at `GET /metrics`.
-The configured policy treats 5xx and other statuses as availability errors;
-4xx responses count as served requests. Its example objectives are 99%
-availability and 250 ms latency.
+`GET /metrics` exposes Prometheus metrics for requests to `/api/orders` only.
+Health, readiness, operator, metrics, and unknown paths are not business
+observations. The labels are bounded to the fixed route, method group, and
+status class.
 
-For example, capture one cohort's observations (network errors are recorded with
-status `0`, redirects are recorded as their original 3xx response, and each
-output path must be new):
+The Prometheus rules use an example policy of 99% availability and 250 ms p95
+latency. For availability, 5xx and other statuses are errors while 4xx responses
+remain in the denominator. These are policy values for the lab; they are not
+measured SLO results.
+
+The `load` command sends GET requests and writes timestamp, cohort, latency, and
+status observations to a new CSV file. A network failure is recorded as status
+`0`; redirects remain their original 3xx response. For a local walkthrough,
+start a second copy in another PowerShell window on port 8001:
 
 ```powershell
-reliability-lab load --url http://127.0.0.1:8000/api/orders `
-  --cohort stable --requests 100 --concurrency 5 --output evidence\stable.csv
+reliability-lab serve --database data\candidate.db --port 8001
 ```
 
-Run a second load command with `--cohort candidate` and a different output
-file. Point each command at a URL that actually reaches the named cohort; the
-cohort is a caller-supplied label and is not inferred from the response. Combine
-the resulting CSV observations into one file with this standard library
-snippet, then run the offline policy analyzer:
+For this local comparison, use the two local endpoints:
 
-```python
+```powershell
+$stableUrl = "http://127.0.0.1:8000/api/orders"
+$candidateUrl = "http://127.0.0.1:8001/api/orders"
+reliability-lab load --url $stableUrl --cohort stable `
+  --requests 100 --concurrency 5 --output evidence\stable.csv
+reliability-lab load --url $candidateUrl --cohort candidate `
+  --requests 100 --concurrency 5 --output evidence\candidate.csv
+```
+
+The cohort is a label supplied by the caller, not discovered from the URL or
+response. Point each command at the corresponding stable or candidate service.
+Combine the observations and compare them offline:
+
+```powershell
+@'
 import csv
 from pathlib import Path
 
@@ -84,92 +87,73 @@ with (
     writer.writeheader()
     writer.writerows(csv.DictReader(stable))
     writer.writerows(csv.DictReader(candidate))
-```
-
-```powershell
+'@ | python -
 reliability-lab analyze-canary --input evidence\combined.csv --min-samples 20
 ```
 
-The analyzer rejects missing, malformed, oversized, empty, or one-cohort
-evidence. It reports `inconclusive` until both cohorts meet the minimum sample
-count, and exits with code 2 for that decision. A failed policy exits 1; a pass
-exits 0. Defaults are a candidate error-rate ceiling of 1% and a p95 ceiling of
-1.25 times the stable p95. The analyzer only evaluates the supplied rows; it
-does not deploy, route, or roll back a release.
+The analyzer needs both cohorts and at least 20 observations in each by default.
+It counts network failures, 1xx, and 5xx responses as errors; 4xx responses are
+served responses. Its default policy caps candidate errors at 1% and candidate
+p95 at 1.25 times stable p95. Exit code `0` means pass, `1` means policy failure
+or invalid evidence, and `2` means inconclusive because a cohort has too few
+samples. The result only describes the rows and policy you supplied; it does
+not route traffic or deploy a release.
 
-`docker compose up --build` starts the app, Prometheus, and Grafana. Set
-`GRAFANA_ADMIN_PASSWORD` before starting Compose. The app, Prometheus, and
-Grafana ports are bound to loopback. The example images are pinned in
-`compose.yaml`. The local Docker, Prometheus, and Grafana services have not been
-executed as part of this repository setup when Docker is unavailable.
+## Inject a fault
 
-## Fault drill and recovery
-
-Fault injection is disabled unless `RELIABILITY_OPERATOR_TOKEN` is set to at
-least 32 visible ASCII characters. Configure the same secret in the service
-and the drill process through a local secret store or environment. The token is
-not a CLI argument and is not logged. Authenticated `POST /operator/fault`
-accepts only `{"kind":"unavailable","ttl_seconds":N}` for 1–30 seconds;
-`POST /operator/clear` removes an active fault. The fault affects only business
-order requests. In a multi-pod deployment the fault is process-local; target a
-single instance (for example, by port-forwarding its Pod) if the purpose is to
-measure that instance without service-level balancing. Run a drill with:
+Fault injection needs `RELIABILITY_OPERATOR_TOKEN` set when the service starts.
+Stop the running server with Ctrl+C, set the token in that PowerShell window
+from your local secret store, then restart `reliability-lab serve` with the same
+database and port. Set the same token separately in the PowerShell window that
+runs the drill. The operator routes are disabled if the service starts without
+it; the token must contain at least 32 visible ASCII characters. Keep it in a
+local secret store rather than a command argument. Then run the drill with a
+fresh output path:
 
 ```powershell
 reliability-lab fault-drill --url http://127.0.0.1:8000/api/orders `
   --requests 20 --concurrency 2 --ttl-seconds 5 --output evidence\fault.json
 ```
 
-The command captures status and latency observations, clears the fault in a
-`finally` path, then checks that requests succeed. It exits nonzero if injection,
-cleanup, injected failures, or recovery verification fail. If cleanup itself
-fails, the service-side TTL remains the upper bound on the injected fault.
+The drill requests a temporary `unavailable` fault, records the resulting
+observations, clears it in a `finally` path, and checks that requests recover.
+The accepted TTL is 1–30 seconds. If the clear request fails, the server-side
+TTL expires the fault. Fault state belongs to one process; in Kubernetes, target
+a Pod directly when you want to measure that instance. The [operations runbook](docs/runbook.md)
+covers deployment setup and this single-instance procedure.
 
-Create a consistent SQLite online backup and restore it to a new path:
+## Back up and restore
 
-```powershell
-reliability-lab backup --database data\reliability.db --output evidence\orders-backup.db
-reliability-lab restore --backup evidence\orders-backup.db --output evidence\orders-restored.db
-```
-
-Each backup has a separate JSON manifest by default. Backup and restore refuse
-to overwrite output files. The restore verifies the manifest's physical file
+The backup command uses SQLite's online backup API and writes a JSON manifest
+beside the database by default. Restore verifies the manifest's database-file
 hash, SQLite integrity, record count, and canonical record checksum before and
-after restore. `reliability-lab recovery-drill` creates a fresh sample order,
-backs it up, restores to a separate file, and writes evidence under
-`evidence/recovery-drill-<id>/`. Its elapsed times are local observations, not
-contractual RTO/RPO values; it does not validate cloud storage or failover.
-
-## Deployment and validation
-
-The Argo Rollouts manifests in `kubernetes/reliability-lab.yaml` define stable
-and candidate Services plus an `AnalysisTemplate`. Failed candidate sample,
-error-rate, or p95 checks fail the rollout analysis, allowing the Argo Rollouts
-controller to abort and return traffic to the stable ReplicaSet. Candidate
-metrics are separated by the `track` label discovered by
-`prometheus/prometheus-kubernetes.yml`. The analysis needs real candidate
-traffic; insufficient samples fail closed. See [the deployment runbook](docs/runbook.md)
-for setup requirements and recovery steps.
-
-The Kubernetes example uses one shared ReadWriteOnce SQLite volume. It is a
-single-node learning setup and is not a highly available multi-node database
-deployment. Configure an appropriate local/default StorageClass and build or
-load `reliability-lab:local` into the target cluster before applying the
-Rollout. Install the Argo Rollouts controller and CRDs separately.
-
-CI runs Ruff, Bandit, pip-audit, Python compilation, and Prometheus configuration
-and rule syntax checks. It does not run a Python behavioral test suite. Local
-Docker/cluster execution requires those services and controllers to be
-available; static checks do not validate runtime networking, scheduling, or
-rollout behavior. See [the incident report template](docs/incident-report-template.md)
-for a blank record format, not observed incident evidence.
-
-Run the Python checks locally after installing the pinned development tools:
+after restoring. Both commands refuse to overwrite existing output files.
 
 ```powershell
-python -m pip install -e ".[dev]"
-ruff check src
-bandit --quiet --recursive src
-pip-audit --skip-editable
-python -m compileall -q src
+reliability-lab backup --database data\reliability.db `
+  --output evidence\orders-backup.db
+reliability-lab restore --backup evidence\orders-backup.db `
+  --output evidence\orders-restored.db
+reliability-lab recovery-drill --output-dir evidence
 ```
+
+Keep the backup manifest with its database. The recovery drill creates a sample
+order and saves its backup, restored database, manifest, and report in a new
+`recovery-drill-<id>` directory. Its timings describe that local run; they do
+not establish an RTO/RPO or validate cloud storage or failover.
+
+## Deployment examples
+
+`docker compose up --build` starts the app, Prometheus, and Grafana; set
+`GRAFANA_ADMIN_PASSWORD` first. The Kubernetes example in
+`kubernetes/reliability-lab.yaml` uses Argo Rollouts and Prometheus analysis for
+stable/candidate traffic. The sample shares a `ReadWriteOnce` SQLite volume and
+is intended for a single-node lab, not a multi-node database or high-availability
+setup. The deployment steps and prerequisites are in the [operations runbook](docs/runbook.md).
+
+The repository's CI runs Ruff, Bandit, pip-audit, Python compilation, and
+Prometheus configuration and rule syntax checks. These static checks do not
+exercise the service or establish runtime behavior for Docker, Kubernetes, or
+Argo Rollouts. There is no observed cluster rollout for this example.
+The [incident report template](docs/incident-report-template.md) is blank, not
+an account of a measured incident.
