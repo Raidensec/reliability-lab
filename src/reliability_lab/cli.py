@@ -196,7 +196,14 @@ def analyze(arguments: argparse.Namespace) -> int:
         arguments.max_p95_regression,
     )
     print_json(report)
-    return {"pass": 0, "fail": 1, "inconclusive": 2}[report["decision"]]
+    decision = report["decision"]
+    if decision == "pass":
+        return 0
+    if decision == "fail":
+        return 1
+    if decision == "inconclusive":
+        return 2
+    raise KeyError(decision)
 
 
 def recovery_drill(arguments: argparse.Namespace) -> int:
