@@ -10,7 +10,7 @@ requires-python = ">=3.12,<3.13"
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["ruff==0.14.0", "bandit==1.8.6", "pip-audit==2.9.0"]
+dev = ["ruff==0.17.2", "bandit==1.8.6", "pip-audit==2.9.0"]
 
 [project.scripts]
 reliability-lab = "reliability_lab.cli:main"
